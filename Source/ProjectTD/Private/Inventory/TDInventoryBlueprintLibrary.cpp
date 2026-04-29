@@ -25,6 +25,7 @@ namespace TDInventory
     const FName ItemTypePropertyName(TEXT("ItemType"));
     const FName EquipSlotPropertyName(TEXT("EquipSlot"));
     const FName DropMeshPropertyName(TEXT("DropMesh"));
+    constexpr int32 EmptySlotDurability = -1;
     const TCHAR* DefaultItemTablePath = TEXT("/Game/ProjectTD/\u7ed3\u6784\u4e0e\u679a\u4e3e/DT_Item.DT_Item");
 
     struct FInventoryComponentAccess
@@ -40,7 +41,7 @@ namespace TDInventory
         UScriptStruct* Struct = nullptr;
         FNameProperty* ItemIDProperty = nullptr;
         FIntProperty* QuantityProperty = nullptr;
-        FIntProperty* CurrentDurabilityProperty = nullptr;
+        FProperty* CurrentDurabilityProperty = nullptr;
     };
 
     struct FEquipmentComponentAccess
@@ -163,6 +164,42 @@ namespace TDInventory
         if (const FUInt32Property* UInt32Property = CastField<FUInt32Property>(Property))
         {
             OutValue = static_cast<int32>(UInt32Property->GetPropertyValue(ValuePtr));
+            return true;
+        }
+
+        return false;
+    }
+
+    bool ReadNumericValueAsInt(const FProperty* Property, const void* ValuePtr, int32& OutValue)
+    {
+        if (ReadIntValue(Property, ValuePtr, OutValue))
+        {
+            return true;
+        }
+
+        if (const FNumericProperty* NumericProperty = CastField<FNumericProperty>(Property))
+        {
+            OutValue = NumericProperty->IsFloatingPoint()
+                ? FMath::RoundToInt(NumericProperty->GetFloatingPointPropertyValue(ValuePtr))
+                : static_cast<int32>(NumericProperty->GetSignedIntPropertyValue(ValuePtr));
+            return true;
+        }
+
+        return false;
+    }
+
+    bool WriteNumericValueFromInt(const FProperty* Property, void* ValuePtr, int32 Value)
+    {
+        if (const FNumericProperty* NumericProperty = CastField<FNumericProperty>(Property))
+        {
+            if (NumericProperty->IsFloatingPoint())
+            {
+                NumericProperty->SetFloatingPointPropertyValue(ValuePtr, static_cast<double>(Value));
+            }
+            else
+            {
+                NumericProperty->SetIntPropertyValue(ValuePtr, static_cast<int64>(Value));
+            }
             return true;
         }
 
@@ -333,7 +370,7 @@ namespace TDInventory
         Access.Struct = StructProperty->Struct;
         Access.ItemIDProperty = FindFProperty<FNameProperty>(Access.Struct, ItemIDPropertyName);
         Access.QuantityProperty = FindFProperty<FIntProperty>(Access.Struct, QuantityPropertyName);
-        Access.CurrentDurabilityProperty = FindFProperty<FIntProperty>(Access.Struct, CurrentDurabilityPropertyName);
+        Access.CurrentDurabilityProperty = FindFProperty<FProperty>(Access.Struct, CurrentDurabilityPropertyName);
 
         if (!Access.ItemIDProperty)
         {
@@ -363,10 +400,10 @@ namespace TDInventory
 
         if (!Access.CurrentDurabilityProperty)
         {
-            for (TFieldIterator<FIntProperty> It(Access.Struct); It; ++It)
+            for (TFieldIterator<FProperty> It(Access.Struct); It; ++It)
             {
-                FIntProperty* Candidate = *It;
-                if (Candidate->GetName().Contains(TEXT("Durability"), ESearchCase::IgnoreCase))
+                FProperty* Candidate = *It;
+                if (Candidate->GetName().Contains(TEXT("Durability"), ESearchCase::IgnoreCase) && CastField<FNumericProperty>(Candidate))
                 {
                     Access.CurrentDurabilityProperty = Candidate;
                     break;
@@ -418,6 +455,7 @@ namespace TDInventory
     FTDInventorySlotData ReadSlotData(const FSlotStructAccess& SlotAccess, const void* SlotPtr)
     {
         FTDInventorySlotData Data;
+        Data.CurrentDurability = EmptySlotDurability;
         if (!SlotAccess.Struct || !SlotPtr)
         {
             return Data;
@@ -425,10 +463,25 @@ namespace TDInventory
 
         Data.ItemID = SlotAccess.ItemIDProperty->GetPropertyValue_InContainer(SlotPtr);
         Data.Quantity = SlotAccess.QuantityProperty->GetPropertyValue_InContainer(SlotPtr);
-        Data.CurrentDurability = SlotAccess.CurrentDurabilityProperty
-            ? SlotAccess.CurrentDurabilityProperty->GetPropertyValue_InContainer(SlotPtr)
-            : 0;
+        if (SlotAccess.CurrentDurabilityProperty)
+        {
+            ReadNumericValueAsInt(
+                SlotAccess.CurrentDurabilityProperty,
+                SlotAccess.CurrentDurabilityProperty->ContainerPtrToValuePtr<void>(SlotPtr),
+                Data.CurrentDurability
+            );
+        }
         Data.bIsEmpty = Data.ItemID.IsNone() || Data.Quantity <= 0;
+        return Data;
+    }
+
+    FTDInventorySlotData MakeEmptySlotData()
+    {
+        FTDInventorySlotData Data;
+        Data.ItemID = NAME_None;
+        Data.Quantity = 0;
+        Data.CurrentDurability = EmptySlotDurability;
+        Data.bIsEmpty = true;
         return Data;
     }
 
@@ -439,12 +492,29 @@ namespace TDInventory
             return;
         }
 
-        SlotAccess.ItemIDProperty->SetPropertyValue_InContainer(SlotPtr, Data.bIsEmpty ? NAME_None : Data.ItemID);
-        SlotAccess.QuantityProperty->SetPropertyValue_InContainer(SlotPtr, Data.bIsEmpty ? 0 : Data.Quantity);
+        const bool bWriteEmptySlot = Data.bIsEmpty || Data.ItemID.IsNone() || Data.Quantity <= 0;
+        SlotAccess.ItemIDProperty->SetPropertyValue_InContainer(SlotPtr, bWriteEmptySlot ? NAME_None : Data.ItemID);
+        SlotAccess.QuantityProperty->SetPropertyValue_InContainer(SlotPtr, bWriteEmptySlot ? 0 : Data.Quantity);
         if (SlotAccess.CurrentDurabilityProperty)
         {
-            SlotAccess.CurrentDurabilityProperty->SetPropertyValue_InContainer(SlotPtr, Data.bIsEmpty ? 0 : Data.CurrentDurability);
+            WriteNumericValueFromInt(
+                SlotAccess.CurrentDurabilityProperty,
+                SlotAccess.CurrentDurabilityProperty->ContainerPtrToValuePtr<void>(SlotPtr),
+                bWriteEmptySlot ? EmptySlotDurability : Data.CurrentDurability
+            );
         }
+    }
+
+    FString SlotToDebugString(int32 Index, const FTDInventorySlotData& SlotData)
+    {
+        return FString::Printf(
+            TEXT("Index=%d ItemID=%s Quantity=%d CurrentDurability=%d bIsEmpty=%s"),
+            Index,
+            *SlotData.ItemID.ToString(),
+            SlotData.Quantity,
+            SlotData.CurrentDurability,
+            SlotData.bIsEmpty ? TEXT("true") : TEXT("false")
+        );
     }
 
     int32 GetDesiredSlotCount(const FInventoryComponentAccess& Access)
@@ -469,7 +539,7 @@ namespace TDInventory
         SlotsHelper.Resize(DesiredSlots);
         for (int32 Index = PreviousNum; Index < DesiredSlots; ++Index)
         {
-            WriteSlotData(SlotAccess, SlotsHelper.GetRawPtr(Index), FTDInventorySlotData());
+            WriteSlotData(SlotAccess, SlotsHelper.GetRawPtr(Index), MakeEmptySlotData());
         }
     }
 
@@ -599,7 +669,7 @@ namespace TDInventory
         SlotData.Quantity -= QuantityRemoved;
         if (SlotData.Quantity <= 0)
         {
-            SlotData = FTDInventorySlotData();
+            SlotData = MakeEmptySlotData();
         }
 
         WriteSlotData(SlotAccess, SlotsHelper.GetRawPtr(SlotIndex), SlotData);
@@ -1346,44 +1416,83 @@ bool UTDInventoryBlueprintLibrary::MoveItem(UObject* InventoryContext, int32 Fro
 
     FTDInventorySlotData FromSlot = TDInventory::ReadSlotData(SlotAccess, SlotsHelper.GetRawPtr(FromIndex));
     FTDInventorySlotData ToSlot = TDInventory::ReadSlotData(SlotAccess, SlotsHelper.GetRawPtr(ToIndex));
+    UE_LOG(
+        LogTemp,
+        Warning,
+        TEXT("MoveItem Before | From: %s | To: %s"),
+        *TDInventory::SlotToDebugString(FromIndex, FromSlot),
+        *TDInventory::SlotToDebugString(ToIndex, ToSlot)
+    );
     if (FromSlot.bIsEmpty)
     {
         return false;
     }
 
-    bool bChanged = false;
-    const TDInventory::FItemDataView ItemData = TDInventory::GetItemData(Access.Object, FromSlot.ItemID);
-    if (!ToSlot.bIsEmpty && TDInventory::IsSameItem(FromSlot, ToSlot) && TDInventory::IsStackableItem(ItemData))
+    if (ToSlot.bIsEmpty)
     {
-        const int32 AvailableSpace = ItemData.MaxStackSize - ToSlot.Quantity;
-        const int32 QuantityToMove = FMath::Min(AvailableSpace, FromSlot.Quantity);
-        if (QuantityToMove > 0)
+        TDInventory::WriteSlotData(SlotAccess, SlotsHelper.GetRawPtr(FromIndex), TDInventory::MakeEmptySlotData());
+        TDInventory::WriteSlotData(SlotAccess, SlotsHelper.GetRawPtr(ToIndex), FromSlot);
+        const FTDInventorySlotData AfterFromSlot = TDInventory::ReadSlotData(SlotAccess, SlotsHelper.GetRawPtr(FromIndex));
+        const FTDInventorySlotData AfterToSlot = TDInventory::ReadSlotData(SlotAccess, SlotsHelper.GetRawPtr(ToIndex));
+        UE_LOG(
+            LogTemp,
+            Warning,
+            TEXT("MoveItem MoveToEmpty | From: %s | To: %s"),
+            *TDInventory::SlotToDebugString(FromIndex, AfterFromSlot),
+            *TDInventory::SlotToDebugString(ToIndex, AfterToSlot)
+        );
+        TDInventory::BroadcastDelegate(Access.Object, Access.UpdatedDelegateProperty);
+        return true;
+    }
+
+    if (TDInventory::IsSameItem(FromSlot, ToSlot))
+    {
+        const TDInventory::FItemDataView ItemData = TDInventory::GetItemData(Access.Object, FromSlot.ItemID);
+        if (TDInventory::IsStackableItem(ItemData))
         {
+            const int32 AvailableSpace = ItemData.MaxStackSize - ToSlot.Quantity;
+            if (AvailableSpace <= 0)
+            {
+                return false;
+            }
+
+            const int32 QuantityToMove = FMath::Min(AvailableSpace, FromSlot.Quantity);
             ToSlot.Quantity += QuantityToMove;
             FromSlot.Quantity -= QuantityToMove;
             if (FromSlot.Quantity <= 0)
             {
-                FromSlot = FTDInventorySlotData();
+                FromSlot = TDInventory::MakeEmptySlotData();
             }
 
             TDInventory::WriteSlotData(SlotAccess, SlotsHelper.GetRawPtr(FromIndex), FromSlot);
             TDInventory::WriteSlotData(SlotAccess, SlotsHelper.GetRawPtr(ToIndex), ToSlot);
-            bChanged = true;
+            const FTDInventorySlotData AfterFromSlot = TDInventory::ReadSlotData(SlotAccess, SlotsHelper.GetRawPtr(FromIndex));
+            const FTDInventorySlotData AfterToSlot = TDInventory::ReadSlotData(SlotAccess, SlotsHelper.GetRawPtr(ToIndex));
+            UE_LOG(
+                LogTemp,
+                Warning,
+                TEXT("MoveItem Stack | From: %s | To: %s"),
+                *TDInventory::SlotToDebugString(FromIndex, AfterFromSlot),
+                *TDInventory::SlotToDebugString(ToIndex, AfterToSlot)
+            );
+            TDInventory::BroadcastDelegate(Access.Object, Access.UpdatedDelegateProperty);
+            return true;
         }
     }
-    else
-    {
-        TDInventory::WriteSlotData(SlotAccess, SlotsHelper.GetRawPtr(FromIndex), ToSlot);
-        TDInventory::WriteSlotData(SlotAccess, SlotsHelper.GetRawPtr(ToIndex), FromSlot);
-        bChanged = true;
-    }
 
-    if (bChanged)
-    {
-        TDInventory::BroadcastDelegate(Access.Object, Access.UpdatedDelegateProperty);
-    }
-
-    return bChanged;
+    TDInventory::WriteSlotData(SlotAccess, SlotsHelper.GetRawPtr(FromIndex), ToSlot);
+    TDInventory::WriteSlotData(SlotAccess, SlotsHelper.GetRawPtr(ToIndex), FromSlot);
+    const FTDInventorySlotData AfterFromSlot = TDInventory::ReadSlotData(SlotAccess, SlotsHelper.GetRawPtr(FromIndex));
+    const FTDInventorySlotData AfterToSlot = TDInventory::ReadSlotData(SlotAccess, SlotsHelper.GetRawPtr(ToIndex));
+    UE_LOG(
+        LogTemp,
+        Warning,
+        TEXT("MoveItem Swap | From: %s | To: %s"),
+        *TDInventory::SlotToDebugString(FromIndex, AfterFromSlot),
+        *TDInventory::SlotToDebugString(ToIndex, AfterToSlot)
+    );
+    TDInventory::BroadcastDelegate(Access.Object, Access.UpdatedDelegateProperty);
+    return true;
 }
 
 bool UTDInventoryBlueprintLibrary::SplitStack(UObject* InventoryContext, int32 SourceIndex, int32 SplitQuantity, int32& OutNewSlotIndex)
@@ -1519,7 +1628,7 @@ TArray<FTDInventorySlotData> UTDInventoryBlueprintLibrary::GetInventorySlots(UOb
         }
         else
         {
-            Result.Add(FTDInventorySlotData());
+            Result.Add(TDInventory::MakeEmptySlotData());
         }
     }
 
