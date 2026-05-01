@@ -1681,7 +1681,7 @@ TArray<FTDInventoryActionEntry> UTDInventoryBlueprintLibrary::GetAvailableAction
         Actions.Add(EquipAction);
     }
 
-    if (SlotData.Quantity > 1 && TDInventory::IsStackableItem(ItemData))
+    if (TDInventory::IsStackableItem(ItemData))
     {
         FTDInventoryActionEntry SplitAction;
         SplitAction.Action = ETDInventoryItemAction::Split;
