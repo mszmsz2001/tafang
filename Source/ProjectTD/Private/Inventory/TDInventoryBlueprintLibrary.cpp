@@ -25,6 +25,7 @@ namespace TDInventory
     const FName ItemTypePropertyName(TEXT("ItemType"));
     const FName EquipSlotPropertyName(TEXT("EquipSlot"));
     const FName DropMeshPropertyName(TEXT("DropMesh"));
+    const FName ItemDataTableRefPropertyName(TEXT("ItemDataTableRef"));
     constexpr int32 EmptySlotDurability = -1;
     const TCHAR* DefaultItemTablePath = TEXT("/Game/ProjectTD/\u7ed3\u6784\u4e0e\u679a\u4e3e/DT_Item.DT_Item");
 
@@ -129,6 +130,17 @@ namespace TDInventory
     {
         if (InventoryObject)
         {
+            if (FObjectProperty* ItemDataTableRefProperty = FindFProperty<FObjectProperty>(InventoryObject->GetClass(), ItemDataTableRefPropertyName))
+            {
+                if (ItemDataTableRefProperty->PropertyClass->IsChildOf(UDataTable::StaticClass()))
+                {
+                    if (UDataTable* DataTable = Cast<UDataTable>(ItemDataTableRefProperty->GetObjectPropertyValue_InContainer(InventoryObject)))
+                    {
+                        return DataTable;
+                    }
+                }
+            }
+
             for (TFieldIterator<FObjectProperty> It(InventoryObject->GetClass()); It; ++It)
             {
                 FObjectProperty* ObjectProperty = *It;
@@ -1179,37 +1191,34 @@ bool UTDInventoryBlueprintLibrary::TryAddItem(UObject* InventoryContext, FName I
         return false;
     }
 
-    int32 RemainingCapacityCheck = Quantity;
-    if (bIsStackable)
-    {
-        for (int32 Index = 0; Index < SlotsHelper.Num() && RemainingCapacityCheck > 0; ++Index)
-        {
-            const FTDInventorySlotData SlotData = TDInventory::ReadSlotData(SlotAccess, SlotsHelper.GetRawPtr(Index));
-            if (SlotData.bIsEmpty || SlotData.ItemID != ItemID)
-            {
-                continue;
-            }
+    UE_LOG(
+        LogTemp,
+        Warning,
+        TEXT("TryAddItem Begin | ItemID=%s Quantity=%d DataFound=%s Stackable=%s MaxStack=%d RawSlots=%d DesiredSlots=%d"),
+        *ItemID.ToString(),
+        Quantity,
+        ItemData.bFound ? TEXT("true") : TEXT("false"),
+        bIsStackable ? TEXT("true") : TEXT("false"),
+        ItemData.MaxStackSize,
+        SlotsHelper.Num(),
+        DesiredSlotCount
+    );
 
-            RemainingCapacityCheck -= FMath::Max(0, ItemData.MaxStackSize - SlotData.Quantity);
-        }
+    TArray<FTDInventorySlotData> WorkingSlots;
+    WorkingSlots.Reserve(DesiredSlotCount);
+    for (int32 Index = 0; Index < DesiredSlotCount; ++Index)
+    {
+        WorkingSlots.Add(SlotsHelper.IsValidIndex(Index)
+            ? TDInventory::ReadSlotData(SlotAccess, SlotsHelper.GetRawPtr(Index))
+            : TDInventory::MakeEmptySlotData());
     }
 
-    const int32 EmptySlotCount = TDInventory::CountEmptySlots(SlotsHelper, SlotAccess, DesiredSlotCount);
-    const int32 EmptySlotCapacity = bIsStackable ? EmptySlotCount * ItemData.MaxStackSize : EmptySlotCount;
-    RemainingCapacityCheck -= EmptySlotCapacity;
-    if (RemainingCapacityCheck > 0)
-    {
-        return false;
-    }
-
-    TDInventory::EnsureSlotCapacity(Access, SlotsHelper, SlotAccess);
     int32 RemainingQuantity = Quantity;
-
     if (bIsStackable)
     {
-        for (int32 Index = 0; Index < SlotsHelper.Num() && RemainingQuantity > 0; ++Index)
+        for (int32 Index = 0; Index < WorkingSlots.Num() && RemainingQuantity > 0; ++Index)
         {
-            FTDInventorySlotData SlotData = TDInventory::ReadSlotData(SlotAccess, SlotsHelper.GetRawPtr(Index));
+            FTDInventorySlotData& SlotData = WorkingSlots[Index];
             if (SlotData.bIsEmpty || SlotData.ItemID != ItemID)
             {
                 continue;
@@ -1224,18 +1233,45 @@ bool UTDInventoryBlueprintLibrary::TryAddItem(UObject* InventoryContext, FName I
             const int32 QuantityToAdd = FMath::Min(AvailableSpace, RemainingQuantity);
             SlotData.Quantity += QuantityToAdd;
             SlotData.bIsEmpty = false;
-            TDInventory::WriteSlotData(SlotAccess, SlotsHelper.GetRawPtr(Index), SlotData);
             RemainingQuantity -= QuantityToAdd;
             QuantityAdded += QuantityToAdd;
+            UE_LOG(
+                LogTemp,
+                Warning,
+                TEXT("TryAddItem StackExisting | Index=%d Added=%d Remaining=%d Slot=%s"),
+                Index,
+                QuantityToAdd,
+                RemainingQuantity,
+                *TDInventory::SlotToDebugString(Index, SlotData)
+            );
         }
     }
 
     while (RemainingQuantity > 0)
     {
-        const int32 EmptySlotIndex = TDInventory::FindFirstEmptySlot(SlotsHelper, SlotAccess);
+        int32 EmptySlotIndex = INDEX_NONE;
+        for (int32 Index = 0; Index < WorkingSlots.Num(); ++Index)
+        {
+            if (WorkingSlots[Index].bIsEmpty)
+            {
+                EmptySlotIndex = Index;
+                break;
+            }
+        }
+
         if (EmptySlotIndex == INDEX_NONE)
         {
-            break;
+            UE_LOG(
+                LogTemp,
+                Warning,
+                TEXT("TryAddItem FailedNoSpace | ItemID=%s Requested=%d AddedInSimulation=%d Remaining=%d"),
+                *ItemID.ToString(),
+                Quantity,
+                QuantityAdded,
+                RemainingQuantity
+            );
+            QuantityAdded = 0;
+            return false;
         }
 
         FTDInventorySlotData NewSlot;
@@ -1243,18 +1279,39 @@ bool UTDInventoryBlueprintLibrary::TryAddItem(UObject* InventoryContext, FName I
         NewSlot.Quantity = bIsStackable ? FMath::Min(ItemData.MaxStackSize, RemainingQuantity) : 1;
         NewSlot.CurrentDurability = 0;
         NewSlot.bIsEmpty = false;
-        TDInventory::WriteSlotData(SlotAccess, SlotsHelper.GetRawPtr(EmptySlotIndex), NewSlot);
+        WorkingSlots[EmptySlotIndex] = NewSlot;
         RemainingQuantity -= NewSlot.Quantity;
         QuantityAdded += NewSlot.Quantity;
+        UE_LOG(
+            LogTemp,
+            Warning,
+            TEXT("TryAddItem NewStack | Index=%d Added=%d Remaining=%d Slot=%s"),
+            EmptySlotIndex,
+            NewSlot.Quantity,
+            RemainingQuantity,
+            *TDInventory::SlotToDebugString(EmptySlotIndex, NewSlot)
+        );
     }
 
-    const bool bChanged = QuantityAdded == Quantity;
-    if (bChanged)
+    if (QuantityAdded != Quantity)
     {
-        TDInventory::BroadcastDelegate(Access.Object, Access.UpdatedDelegateProperty);
+        QuantityAdded = 0;
+        return false;
     }
 
-    return bChanged;
+    if (SlotsHelper.Num() < WorkingSlots.Num())
+    {
+        SlotsHelper.Resize(WorkingSlots.Num());
+    }
+
+    for (int32 Index = 0; Index < WorkingSlots.Num(); ++Index)
+    {
+        TDInventory::WriteSlotData(SlotAccess, SlotsHelper.GetRawPtr(Index), WorkingSlots[Index]);
+    }
+
+    TDInventory::BroadcastDelegate(Access.Object, Access.UpdatedDelegateProperty);
+    UE_LOG(LogTemp, Warning, TEXT("TryAddItem Success | ItemID=%s QuantityAdded=%d"), *ItemID.ToString(), QuantityAdded);
+    return true;
 }
 
 bool UTDInventoryBlueprintLibrary::TryRemoveItem(UObject* InventoryContext, FName ItemID, int32 Quantity, int32& QuantityRemoved)
@@ -1448,11 +1505,27 @@ bool UTDInventoryBlueprintLibrary::MoveItem(UObject* InventoryContext, int32 Fro
     if (TDInventory::IsSameItem(FromSlot, ToSlot))
     {
         const TDInventory::FItemDataView ItemData = TDInventory::GetItemData(Access.Object, FromSlot.ItemID);
+        UE_LOG(
+            LogTemp,
+            Warning,
+            TEXT("MoveItem SameItem | ItemID=%s DataFound=%s Stackable=%s MaxStack=%d"),
+            *FromSlot.ItemID.ToString(),
+            ItemData.bFound ? TEXT("true") : TEXT("false"),
+            TDInventory::IsStackableItem(ItemData) ? TEXT("true") : TEXT("false"),
+            ItemData.MaxStackSize
+        );
         if (TDInventory::IsStackableItem(ItemData))
         {
             const int32 AvailableSpace = ItemData.MaxStackSize - ToSlot.Quantity;
             if (AvailableSpace <= 0)
             {
+                UE_LOG(
+                    LogTemp,
+                    Warning,
+                    TEXT("MoveItem StackFull | From: %s | To: %s"),
+                    *TDInventory::SlotToDebugString(FromIndex, FromSlot),
+                    *TDInventory::SlotToDebugString(ToIndex, ToSlot)
+                );
                 return false;
             }
 
