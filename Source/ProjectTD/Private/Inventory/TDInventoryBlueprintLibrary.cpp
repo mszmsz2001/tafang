@@ -26,6 +26,7 @@ namespace TDInventory
     const FName EquipSlotPropertyName(TEXT("EquipSlot"));
     const FName DropMeshPropertyName(TEXT("DropMesh"));
     const FName ItemDataTableRefPropertyName(TEXT("ItemDataTableRef"));
+    const FName DroppedItemActorClassPropertyName(TEXT("DroppedItemActorClass"));
     constexpr int32 EmptySlotDurability = -1;
     const TCHAR* DefaultItemTablePath = TEXT("/Game/ProjectTD/\u7ed3\u6784\u4e0e\u679a\u4e3e/DT_Item.DT_Item");
 
@@ -257,6 +258,23 @@ namespace TDInventory
         return false;
     }
 
+    UClass* ReadActorClassValue(const FProperty* Property, const void* ValuePtr)
+    {
+        if (const FClassProperty* ClassProperty = CastField<FClassProperty>(Property))
+        {
+            UClass* ClassValue = Cast<UClass>(ClassProperty->GetPropertyValue(ValuePtr));
+            return ClassValue && ClassValue->IsChildOf(AActor::StaticClass()) ? ClassValue : nullptr;
+        }
+
+        if (const FSoftClassProperty* SoftClassProperty = CastField<FSoftClassProperty>(Property))
+        {
+            UClass* ClassValue = Cast<UClass>(SoftClassProperty->GetPropertyValue(ValuePtr).LoadSynchronous());
+            return ClassValue && ClassValue->IsChildOf(AActor::StaticClass()) ? ClassValue : nullptr;
+        }
+
+        return nullptr;
+    }
+
     bool ReadEnumDisplayValue(const FProperty* Property, const void* ValuePtr, int64& OutValue, FString& OutDisplay)
     {
         UEnum* Enum = nullptr;
@@ -290,6 +308,30 @@ namespace TDInventory
         }
 
         return Property->GetFName() == ExactName || Property->GetName().Contains(FallbackToken, ESearchCase::IgnoreCase);
+    }
+
+    FProperty* FindPropertyByNameOrToken(UClass* Class, const FName& ExactName, const TCHAR* FallbackToken)
+    {
+        if (!Class)
+        {
+            return nullptr;
+        }
+
+        if (FProperty* Property = FindFProperty<FProperty>(Class, ExactName))
+        {
+            return Property;
+        }
+
+        for (TFieldIterator<FProperty> It(Class); It; ++It)
+        {
+            FProperty* Candidate = *It;
+            if (PropertyNameMatches(Candidate, ExactName, FallbackToken))
+            {
+                return Candidate;
+            }
+        }
+
+        return nullptr;
     }
 
     FInventoryComponentAccess ResolveInventory(UObject* InventoryContext)
@@ -533,51 +575,7 @@ namespace TDInventory
     {
         if (Access.MaxSlotsProperty && Access.Object)
         {
-            const int32 InstanceMaxSlots = Access.MaxSlotsProperty->GetPropertyValue_InContainer(Access.Object);
-            if (InstanceMaxSlots > 0)
-            {
-                return InstanceMaxSlots;
-            }
-
-            UObject* DefaultObject = Access.Object->GetClass() ? Access.Object->GetClass()->GetDefaultObject() : nullptr;
-            const int32 DefaultMaxSlots = DefaultObject
-                ? Access.MaxSlotsProperty->GetPropertyValue_InContainer(DefaultObject)
-                : 0;
-            return FMath::Max(0, DefaultMaxSlots);
-        }
-
-        return 0;
-    }
-
-    int32 RepairInvalidMaxSlotsFromDefaults(const FInventoryComponentAccess& Access)
-    {
-        if (!Access.Object || !Access.MaxSlotsProperty)
-        {
-            return 0;
-        }
-
-        const int32 InstanceMaxSlots = Access.MaxSlotsProperty->GetPropertyValue_InContainer(Access.Object);
-        if (InstanceMaxSlots > 0)
-        {
-            return InstanceMaxSlots;
-        }
-
-        UObject* DefaultObject = Access.Object->GetClass() ? Access.Object->GetClass()->GetDefaultObject() : nullptr;
-        const int32 DefaultMaxSlots = DefaultObject
-            ? Access.MaxSlotsProperty->GetPropertyValue_InContainer(DefaultObject)
-            : 0;
-        if (DefaultMaxSlots > 0)
-        {
-            Access.MaxSlotsProperty->SetPropertyValue_InContainer(Access.Object, DefaultMaxSlots);
-            UE_LOG(
-                LogTemp,
-                Warning,
-                TEXT("Inventory MaxSlots repaired from default | Object=%s InstanceMaxSlots=%d DefaultMaxSlots=%d"),
-                *Access.Object->GetName(),
-                InstanceMaxSlots,
-                DefaultMaxSlots
-            );
-            return DefaultMaxSlots;
+            return FMath::Max(0, Access.MaxSlotsProperty->GetPropertyValue_InContainer(Access.Object));
         }
 
         return 0;
@@ -585,8 +583,7 @@ namespace TDInventory
 
     void EnsureSlotCapacity(const FInventoryComponentAccess& Access, FScriptArrayHelper& SlotsHelper, const FSlotStructAccess& SlotAccess)
     {
-        const int32 RepairedSlots = RepairInvalidMaxSlotsFromDefaults(Access);
-        const int32 DesiredSlots = RepairedSlots > 0 ? RepairedSlots : GetDesiredSlotCount(Access);
+        const int32 DesiredSlots = GetDesiredSlotCount(Access);
         if (DesiredSlots <= 0 || SlotsHelper.Num() >= DesiredSlots)
         {
             return;
@@ -731,6 +728,51 @@ namespace TDInventory
 
         WriteSlotData(SlotAccess, SlotsHelper.GetRawPtr(SlotIndex), SlotData);
         return QuantityRemoved > 0;
+    }
+
+    UClass* GetDroppedItemActorClass(UObject* InventoryObject)
+    {
+        FProperty* Property = FindPropertyByNameOrToken(InventoryObject ? InventoryObject->GetClass() : nullptr, DroppedItemActorClassPropertyName, TEXT("DroppedItemActorClass"));
+        return Property && InventoryObject
+            ? ReadActorClassValue(Property, Property->ContainerPtrToValuePtr<void>(InventoryObject))
+            : nullptr;
+    }
+
+    void SetDroppedActorNameProperty(AActor* DroppedActor, const FName& PropertyName, const TCHAR* FallbackToken, FName Value)
+    {
+        FProperty* Property = FindPropertyByNameOrToken(DroppedActor ? DroppedActor->GetClass() : nullptr, PropertyName, FallbackToken);
+        if (FNameProperty* NameProperty = CastField<FNameProperty>(Property))
+        {
+            NameProperty->SetPropertyValue_InContainer(DroppedActor, Value);
+            return;
+        }
+
+        UE_LOG(LogTemp, Warning, TEXT("DropItem could not set %s on %s"), *PropertyName.ToString(), DroppedActor ? *DroppedActor->GetName() : TEXT("null"));
+    }
+
+    void SetDroppedActorNumericProperty(AActor* DroppedActor, const FName& PropertyName, const TCHAR* FallbackToken, int32 Value)
+    {
+        FProperty* Property = FindPropertyByNameOrToken(DroppedActor ? DroppedActor->GetClass() : nullptr, PropertyName, FallbackToken);
+        if (FIntProperty* IntProperty = CastField<FIntProperty>(Property))
+        {
+            IntProperty->SetPropertyValue_InContainer(DroppedActor, Value);
+            return;
+        }
+
+        if (FNumericProperty* NumericProperty = CastField<FNumericProperty>(Property))
+        {
+            WriteNumericValueFromInt(NumericProperty, NumericProperty->ContainerPtrToValuePtr<void>(DroppedActor), Value);
+            return;
+        }
+
+        UE_LOG(LogTemp, Warning, TEXT("DropItem could not set %s on %s"), *PropertyName.ToString(), DroppedActor ? *DroppedActor->GetName() : TEXT("null"));
+    }
+
+    void SetDroppedActorInventoryData(AActor* DroppedActor, const FTDInventorySlotData& SourceSlot, int32 QuantityDropped)
+    {
+        SetDroppedActorNameProperty(DroppedActor, ItemIDPropertyName, TEXT("ItemID"), SourceSlot.ItemID);
+        SetDroppedActorNumericProperty(DroppedActor, QuantityPropertyName, TEXT("Quantity"), QuantityDropped);
+        SetDroppedActorNumericProperty(DroppedActor, CurrentDurabilityPropertyName, TEXT("Durability"), SourceSlot.CurrentDurability);
     }
 
     int32 CountItemInSlots(FScriptArrayHelper& SlotsHelper, const FSlotStructAccess& SlotAccess, FName ItemID)
@@ -1156,14 +1198,9 @@ FString UTDInventoryBlueprintLibrary::GetInventoryDebugSummary(UObject* Inventor
     if (Access.Object && Access.SlotsProperty)
     {
         FScriptArrayHelper SlotsHelper(Access.SlotsProperty, Access.SlotsProperty->ContainerPtrToValuePtr<void>(Access.Object));
-        const TDInventory::FSlotStructAccess SlotAccess = TDInventory::ResolveSlotAccess(Access.SlotsProperty);
-        if (SlotAccess.Struct)
-        {
-            TDInventory::EnsureSlotCapacity(Access, SlotsHelper, SlotAccess);
-        }
-
         Summary += FString::Printf(TEXT(", RawSlots=%d"), SlotsHelper.Num());
 
+        const TDInventory::FSlotStructAccess SlotAccess = TDInventory::ResolveSlotAccess(Access.SlotsProperty);
         if (SlotAccess.Struct)
         {
             int32 NonEmptySlotCount = 0;
@@ -1205,17 +1242,7 @@ FString UTDInventoryBlueprintLibrary::GetInventoryDebugSummary(UObject* Inventor
 
     if (Access.Object && Access.MaxSlotsProperty)
     {
-        UObject* DefaultObject = Access.Object->GetClass() ? Access.Object->GetClass()->GetDefaultObject() : nullptr;
-        const int32 InstanceMaxSlots = Access.MaxSlotsProperty->GetPropertyValue_InContainer(Access.Object);
-        const int32 DefaultMaxSlots = DefaultObject
-            ? Access.MaxSlotsProperty->GetPropertyValue_InContainer(DefaultObject)
-            : 0;
-        Summary += FString::Printf(
-            TEXT(", MaxSlots=%d, InstanceMaxSlots=%d, DefaultMaxSlots=%d"),
-            TDInventory::GetDesiredSlotCount(Access),
-            InstanceMaxSlots,
-            DefaultMaxSlots
-        );
+        Summary += FString::Printf(TEXT(", MaxSlots=%d"), Access.MaxSlotsProperty->GetPropertyValue_InContainer(Access.Object));
     }
 
     return Summary;
@@ -1224,7 +1251,6 @@ FString UTDInventoryBlueprintLibrary::GetInventoryDebugSummary(UObject* Inventor
 int32 UTDInventoryBlueprintLibrary::GetInventoryMaxSlots(UObject* InventoryContext)
 {
     const TDInventory::FInventoryComponentAccess Access = TDInventory::ResolveInventory(InventoryContext);
-    TDInventory::RepairInvalidMaxSlotsFromDefaults(Access);
     return TDInventory::GetDesiredSlotCount(Access);
 }
 
@@ -1715,16 +1741,36 @@ bool UTDInventoryBlueprintLibrary::DropItem(UObject* InventoryContext, int32 Slo
     }
 
     const TDInventory::FItemDataView ItemData = TDInventory::GetItemData(Access.Object, SlotData.ItemID);
+    AActor* SpawnedDropActor = nullptr;
     if (AActor* OwnerActor = TDInventory::ResolveActor(InventoryContext))
     {
         UWorld* World = OwnerActor->GetWorld();
-        if (World && ItemData.DropMesh)
+        if (World)
         {
             const FVector SpawnLocation = DropLocation.IsNearlyZero() ? OwnerActor->GetActorLocation() + OwnerActor->GetActorForwardVector() * 120.0f : DropLocation;
-            AStaticMeshActor* DroppedActor = World->SpawnActor<AStaticMeshActor>(AStaticMeshActor::StaticClass(), SpawnLocation, OwnerActor->GetActorRotation());
-            if (DroppedActor)
+            const FRotator SpawnRotation = OwnerActor->GetActorRotation();
+
+            if (UClass* DroppedItemActorClass = TDInventory::GetDroppedItemActorClass(Access.Object))
             {
-                DroppedActor->GetStaticMeshComponent()->SetStaticMesh(ItemData.DropMesh);
+                const FTransform SpawnTransform(SpawnRotation, SpawnLocation);
+                SpawnedDropActor = World->SpawnActorDeferred<AActor>(DroppedItemActorClass, SpawnTransform, OwnerActor);
+                if (!SpawnedDropActor)
+                {
+                    UE_LOG(LogTemp, Warning, TEXT("DropItem failed to deferred spawn DroppedItemActorClass=%s"), *DroppedItemActorClass->GetName());
+                    return false;
+                }
+
+                TDInventory::SetDroppedActorInventoryData(SpawnedDropActor, SlotData, DesiredDropCount);
+                SpawnedDropActor->FinishSpawning(SpawnTransform);
+            }
+            else if (ItemData.DropMesh)
+            {
+                AStaticMeshActor* DroppedActor = World->SpawnActor<AStaticMeshActor>(AStaticMeshActor::StaticClass(), SpawnLocation, SpawnRotation);
+                if (DroppedActor)
+                {
+                    DroppedActor->GetStaticMeshComponent()->SetStaticMesh(ItemData.DropMesh);
+                    SpawnedDropActor = DroppedActor;
+                }
             }
         }
     }
@@ -1732,6 +1778,10 @@ bool UTDInventoryBlueprintLibrary::DropItem(UObject* InventoryContext, int32 Slo
     int32 RemovedQuantity = 0;
     if (!TDInventory::RemoveQuantityAtSlot(SlotsHelper, SlotAccess, SlotIndex, DesiredDropCount, RemovedQuantity))
     {
+        if (SpawnedDropActor)
+        {
+            SpawnedDropActor->Destroy();
+        }
         return false;
     }
 
@@ -1752,7 +1802,6 @@ TArray<FTDInventorySlotData> UTDInventoryBlueprintLibrary::GetInventorySlots(UOb
     }
 
     FScriptArrayHelper SlotsHelper(Access.SlotsProperty, Access.SlotsProperty->ContainerPtrToValuePtr<void>(Access.Object));
-    TDInventory::EnsureSlotCapacity(Access, SlotsHelper, SlotAccess);
     const int32 DesiredSlotCount = FMath::Max(SlotsHelper.Num(), TDInventory::GetDesiredSlotCount(Access));
     Result.Reserve(DesiredSlotCount);
     for (int32 Index = 0; Index < DesiredSlotCount; ++Index)
