@@ -533,7 +533,51 @@ namespace TDInventory
     {
         if (Access.MaxSlotsProperty && Access.Object)
         {
-            return FMath::Max(0, Access.MaxSlotsProperty->GetPropertyValue_InContainer(Access.Object));
+            const int32 InstanceMaxSlots = Access.MaxSlotsProperty->GetPropertyValue_InContainer(Access.Object);
+            if (InstanceMaxSlots > 0)
+            {
+                return InstanceMaxSlots;
+            }
+
+            UObject* DefaultObject = Access.Object->GetClass() ? Access.Object->GetClass()->GetDefaultObject() : nullptr;
+            const int32 DefaultMaxSlots = DefaultObject
+                ? Access.MaxSlotsProperty->GetPropertyValue_InContainer(DefaultObject)
+                : 0;
+            return FMath::Max(0, DefaultMaxSlots);
+        }
+
+        return 0;
+    }
+
+    int32 RepairInvalidMaxSlotsFromDefaults(const FInventoryComponentAccess& Access)
+    {
+        if (!Access.Object || !Access.MaxSlotsProperty)
+        {
+            return 0;
+        }
+
+        const int32 InstanceMaxSlots = Access.MaxSlotsProperty->GetPropertyValue_InContainer(Access.Object);
+        if (InstanceMaxSlots > 0)
+        {
+            return InstanceMaxSlots;
+        }
+
+        UObject* DefaultObject = Access.Object->GetClass() ? Access.Object->GetClass()->GetDefaultObject() : nullptr;
+        const int32 DefaultMaxSlots = DefaultObject
+            ? Access.MaxSlotsProperty->GetPropertyValue_InContainer(DefaultObject)
+            : 0;
+        if (DefaultMaxSlots > 0)
+        {
+            Access.MaxSlotsProperty->SetPropertyValue_InContainer(Access.Object, DefaultMaxSlots);
+            UE_LOG(
+                LogTemp,
+                Warning,
+                TEXT("Inventory MaxSlots repaired from default | Object=%s InstanceMaxSlots=%d DefaultMaxSlots=%d"),
+                *Access.Object->GetName(),
+                InstanceMaxSlots,
+                DefaultMaxSlots
+            );
+            return DefaultMaxSlots;
         }
 
         return 0;
@@ -541,7 +585,8 @@ namespace TDInventory
 
     void EnsureSlotCapacity(const FInventoryComponentAccess& Access, FScriptArrayHelper& SlotsHelper, const FSlotStructAccess& SlotAccess)
     {
-        const int32 DesiredSlots = GetDesiredSlotCount(Access);
+        const int32 RepairedSlots = RepairInvalidMaxSlotsFromDefaults(Access);
+        const int32 DesiredSlots = RepairedSlots > 0 ? RepairedSlots : GetDesiredSlotCount(Access);
         if (DesiredSlots <= 0 || SlotsHelper.Num() >= DesiredSlots)
         {
             return;
@@ -1111,9 +1156,14 @@ FString UTDInventoryBlueprintLibrary::GetInventoryDebugSummary(UObject* Inventor
     if (Access.Object && Access.SlotsProperty)
     {
         FScriptArrayHelper SlotsHelper(Access.SlotsProperty, Access.SlotsProperty->ContainerPtrToValuePtr<void>(Access.Object));
+        const TDInventory::FSlotStructAccess SlotAccess = TDInventory::ResolveSlotAccess(Access.SlotsProperty);
+        if (SlotAccess.Struct)
+        {
+            TDInventory::EnsureSlotCapacity(Access, SlotsHelper, SlotAccess);
+        }
+
         Summary += FString::Printf(TEXT(", RawSlots=%d"), SlotsHelper.Num());
 
-        const TDInventory::FSlotStructAccess SlotAccess = TDInventory::ResolveSlotAccess(Access.SlotsProperty);
         if (SlotAccess.Struct)
         {
             int32 NonEmptySlotCount = 0;
@@ -1155,7 +1205,17 @@ FString UTDInventoryBlueprintLibrary::GetInventoryDebugSummary(UObject* Inventor
 
     if (Access.Object && Access.MaxSlotsProperty)
     {
-        Summary += FString::Printf(TEXT(", MaxSlots=%d"), Access.MaxSlotsProperty->GetPropertyValue_InContainer(Access.Object));
+        UObject* DefaultObject = Access.Object->GetClass() ? Access.Object->GetClass()->GetDefaultObject() : nullptr;
+        const int32 InstanceMaxSlots = Access.MaxSlotsProperty->GetPropertyValue_InContainer(Access.Object);
+        const int32 DefaultMaxSlots = DefaultObject
+            ? Access.MaxSlotsProperty->GetPropertyValue_InContainer(DefaultObject)
+            : 0;
+        Summary += FString::Printf(
+            TEXT(", MaxSlots=%d, InstanceMaxSlots=%d, DefaultMaxSlots=%d"),
+            TDInventory::GetDesiredSlotCount(Access),
+            InstanceMaxSlots,
+            DefaultMaxSlots
+        );
     }
 
     return Summary;
@@ -1164,6 +1224,7 @@ FString UTDInventoryBlueprintLibrary::GetInventoryDebugSummary(UObject* Inventor
 int32 UTDInventoryBlueprintLibrary::GetInventoryMaxSlots(UObject* InventoryContext)
 {
     const TDInventory::FInventoryComponentAccess Access = TDInventory::ResolveInventory(InventoryContext);
+    TDInventory::RepairInvalidMaxSlotsFromDefaults(Access);
     return TDInventory::GetDesiredSlotCount(Access);
 }
 
@@ -1691,6 +1752,7 @@ TArray<FTDInventorySlotData> UTDInventoryBlueprintLibrary::GetInventorySlots(UOb
     }
 
     FScriptArrayHelper SlotsHelper(Access.SlotsProperty, Access.SlotsProperty->ContainerPtrToValuePtr<void>(Access.Object));
+    TDInventory::EnsureSlotCapacity(Access, SlotsHelper, SlotAccess);
     const int32 DesiredSlotCount = FMath::Max(SlotsHelper.Num(), TDInventory::GetDesiredSlotCount(Access));
     Result.Reserve(DesiredSlotCount);
     for (int32 Index = 0; Index < DesiredSlotCount; ++Index)
