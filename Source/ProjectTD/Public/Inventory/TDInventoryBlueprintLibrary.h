@@ -72,8 +72,8 @@ public:
     UFUNCTION(BlueprintPure, Category = "ProjectTD|Inventory")
     static int32 GetInventoryMaxSlots(UObject* InventoryContext);
 
-    UFUNCTION(BlueprintCallable, Category = "ProjectTD|Inventory")
-    static bool TryAddItem(UObject* InventoryContext, FName ItemID, int32 Quantity, int32& QuantityAdded);
+    UFUNCTION(BlueprintCallable, Category = "ProjectTD|Inventory", meta = (CPP_Default_CurrentDurability = "-1.0"))
+    static bool TryAddItem(UObject* InventoryContext, FName ItemID, int32 Quantity, float CurrentDurability, int32& QuantityAdded);
 
     UFUNCTION(BlueprintCallable, Category = "ProjectTD|Inventory")
     static bool TryRemoveItem(UObject* InventoryContext, FName ItemID, int32 Quantity, int32& QuantityRemoved);

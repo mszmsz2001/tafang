@@ -163,6 +163,12 @@ namespace TDInventory
 
     bool ReadIntValue(const FProperty* Property, const void* ValuePtr, int32& OutValue)
     {
+        if (const FEnumProperty* EnumProperty = CastField<FEnumProperty>(Property))
+        {
+            OutValue = static_cast<int32>(EnumProperty->GetUnderlyingProperty()->GetSignedIntPropertyValue(ValuePtr));
+            return true;
+        }
+
         if (const FIntProperty* IntProperty = CastField<FIntProperty>(Property))
         {
             OutValue = IntProperty->GetPropertyValue(ValuePtr);
@@ -204,6 +210,12 @@ namespace TDInventory
 
     bool WriteNumericValueFromInt(const FProperty* Property, void* ValuePtr, int32 Value)
     {
+        if (const FEnumProperty* EnumProperty = CastField<FEnumProperty>(Property))
+        {
+            EnumProperty->GetUnderlyingProperty()->SetIntPropertyValue(ValuePtr, static_cast<int64>(Value));
+            return true;
+        }
+
         if (const FNumericProperty* NumericProperty = CastField<FNumericProperty>(Property))
         {
             if (NumericProperty->IsFloatingPoint())
@@ -710,6 +722,19 @@ namespace TDInventory
         return ItemData.bFound && ItemData.bIsStackable && ItemData.MaxStackSize > 1;
     }
 
+    bool IsItemType(const FItemDataView& ItemData, const TCHAR* TypeName)
+    {
+        return ItemData.ItemTypeName.Equals(TypeName, ESearchCase::IgnoreCase);
+    }
+
+    bool HasValidEquipSlot(const FItemDataView& ItemData)
+    {
+        return ItemData.EquipSlotValue != INDEX_NONE
+            && !ItemData.EquipSlotName.IsEmpty()
+            && !ItemData.EquipSlotName.Equals(TEXT("None"), ESearchCase::IgnoreCase)
+            && !ItemData.EquipSlotName.Equals(TEXT("E_MAX"), ESearchCase::IgnoreCase);
+    }
+
     bool IsSameItem(const FTDInventorySlotData& A, const FTDInventorySlotData& B)
     {
         return !A.bIsEmpty && !B.bIsEmpty && A.ItemID == B.ItemID;
@@ -1056,14 +1081,25 @@ namespace TDInventory
         }
 
         const FItemDataView ItemData = GetItemData(ResolveInventory(InventoryContext).Object, InventorySlot.ItemID);
-        if (!ItemData.bFound || ItemData.EquipSlotValue == INDEX_NONE)
+        if (!ItemData.bFound || !IsItemType(ItemData, TEXT("Equipment")) || !HasValidEquipSlot(ItemData))
         {
+            UE_LOG(
+                LogTemp,
+                Warning,
+                TEXT("TryEquipFromInventory failed: ItemID=%s DataFound=%s ItemType=%s EquipSlot=%s EquipSlotValue=%lld"),
+                *InventorySlot.ItemID.ToString(),
+                ItemData.bFound ? TEXT("true") : TEXT("false"),
+                *ItemData.ItemTypeName,
+                *ItemData.EquipSlotName,
+                ItemData.EquipSlotValue
+            );
             return false;
         }
 
         FEquipmentComponentAccess EquipmentAccess = ResolveEquipment(InventoryContext);
         if (!EquipmentAccess.Object || !EquipmentAccess.EquipSlotsProperty)
         {
+            UE_LOG(LogTemp, Warning, TEXT("TryEquipFromInventory failed: Equipment component or EquipSlots map was not found."));
             return false;
         }
 
@@ -1073,6 +1109,7 @@ namespace TDInventory
         FStructProperty* ValueStructProperty = CastField<FStructProperty>(ValueProperty);
         if (!KeyProperty || !ValueStructProperty || ValueStructProperty->Struct != SlotAccess.Struct)
         {
+            UE_LOG(LogTemp, Warning, TEXT("TryEquipFromInventory failed: EquipSlots key/value type is not compatible with inventory slot data."));
             return false;
         }
 
@@ -1095,6 +1132,10 @@ namespace TDInventory
             }
         }
 
+        FTDInventorySlotData EquippedCopy = InventorySlot;
+        EquippedCopy.Quantity = 1;
+        EquippedCopy.bIsEmpty = false;
+
         if (ExistingMapIndex != INDEX_NONE)
         {
             FTDInventorySlotData EquippedSlot = ReadSlotData(SlotAccess, MapHelper.GetValuePtr(ExistingMapIndex));
@@ -1108,47 +1149,46 @@ namespace TDInventory
                 else
                 {
                     int32 AddedBackQuantity = 0;
-                    if (!UTDInventoryBlueprintLibrary::TryAddItem(InventoryContext, EquippedSlot.ItemID, EquippedSlot.Quantity, AddedBackQuantity) || AddedBackQuantity != EquippedSlot.Quantity)
+                    if (!UTDInventoryBlueprintLibrary::TryAddItem(InventoryContext, EquippedSlot.ItemID, EquippedSlot.Quantity, static_cast<float>(EquippedSlot.CurrentDurability), AddedBackQuantity) || AddedBackQuantity != EquippedSlot.Quantity)
                     {
                         return false;
                     }
                 }
             }
-
-            MapHelper.RemoveAt(ExistingMapIndex);
         }
 
-        const int32 NewMapIndex = MapHelper.AddDefaultValue_Invalid_NeedsRehash();
-        if (NewMapIndex == INDEX_NONE)
+        int32 TargetMapIndex = ExistingMapIndex;
+        if (TargetMapIndex == INDEX_NONE)
         {
-            return false;
+            TargetMapIndex = MapHelper.AddDefaultValue_Invalid_NeedsRehash();
+            if (TargetMapIndex == INDEX_NONE)
+            {
+                return false;
+            }
+
+            if (!WriteNumericValueFromInt(KeyProperty, MapHelper.GetKeyPtr(TargetMapIndex), static_cast<int32>(ItemData.EquipSlotValue)))
+            {
+                MapHelper.RemoveAt(TargetMapIndex);
+                return false;
+            }
         }
 
-        int32 EquipSlotValue = static_cast<int32>(ItemData.EquipSlotValue);
-        if (FEnumProperty* EnumKeyProperty = CastField<FEnumProperty>(KeyProperty))
-        {
-            EnumKeyProperty->GetUnderlyingProperty()->SetIntPropertyValue(MapHelper.GetKeyPtr(NewMapIndex), static_cast<int64>(EquipSlotValue));
-        }
-        else if (FByteProperty* ByteKeyProperty = CastField<FByteProperty>(KeyProperty))
-        {
-            ByteKeyProperty->SetPropertyValue(MapHelper.GetKeyPtr(NewMapIndex), static_cast<uint8>(EquipSlotValue));
-        }
-        else
-        {
-            MapHelper.RemoveAt(NewMapIndex);
-            return false;
-        }
-
-        FTDInventorySlotData EquippedCopy = InventorySlot;
-        EquippedCopy.Quantity = 1;
-        EquippedCopy.bIsEmpty = false;
-        WriteSlotData(SlotAccess, MapHelper.GetValuePtr(NewMapIndex), EquippedCopy);
+        WriteSlotData(SlotAccess, MapHelper.GetValuePtr(TargetMapIndex), EquippedCopy);
         MapHelper.Rehash();
+
+        const FTDInventorySlotData WrittenEquipmentSlot = ReadSlotData(SlotAccess, MapHelper.GetValuePtr(TargetMapIndex));
 
         int32 RemovedQuantity = 0;
         if (!RemoveQuantityAtSlot(SlotsHelper, SlotAccess, SlotIndex, 1, RemovedQuantity))
         {
-            MapHelper.RemoveAt(NewMapIndex);
+            if (ExistingMapIndex == INDEX_NONE)
+            {
+                MapHelper.RemoveAt(TargetMapIndex);
+            }
+            else
+            {
+                WriteSlotData(SlotAccess, MapHelper.GetValuePtr(TargetMapIndex), PreviouslyEquippedSlot);
+            }
             return false;
         }
 
@@ -1159,6 +1199,19 @@ namespace TDInventory
         }
 
         BroadcastDelegate(EquipmentAccess.Object, EquipmentAccess.UpdatedDelegateProperty);
+        UE_LOG(
+            LogTemp,
+            Warning,
+            TEXT("TryEquipFromInventory success: EquipmentObject=%s Class=%s ItemID=%s EquipSlot=%s EquipSlotValue=%lld MapIndex=%d MapPairs=%d WrittenSlot={%s}"),
+            *EquipmentAccess.Object->GetName(),
+            *EquipmentAccess.Object->GetClass()->GetName(),
+            *InventorySlot.ItemID.ToString(),
+            *ItemData.EquipSlotName,
+            ItemData.EquipSlotValue,
+            TargetMapIndex,
+            MapHelper.Num(),
+            *SlotToDebugString(TargetMapIndex, WrittenEquipmentSlot)
+        );
         return true;
     }
 
@@ -1273,7 +1326,7 @@ int32 UTDInventoryBlueprintLibrary::GetInventoryMaxSlots(UObject* InventoryConte
     return TDInventory::GetDesiredSlotCount(Access);
 }
 
-bool UTDInventoryBlueprintLibrary::TryAddItem(UObject* InventoryContext, FName ItemID, int32 Quantity, int32& QuantityAdded)
+static bool TryAddItemInternal(UObject* InventoryContext, FName ItemID, int32 Quantity, float CurrentDurability, int32& QuantityAdded)
 {
     QuantityAdded = 0;
     if (Quantity <= 0 || ItemID.IsNone())
@@ -1292,6 +1345,7 @@ bool UTDInventoryBlueprintLibrary::TryAddItem(UObject* InventoryContext, FName I
     const TDInventory::FItemDataView ItemData = TDInventory::GetItemData(Access.Object, ItemID);
     const bool bIsStackable = TDInventory::IsStackableItem(ItemData);
     const int32 DesiredSlotCount = FMath::Max(SlotsHelper.Num(), TDInventory::GetDesiredSlotCount(Access));
+    const int32 DurabilityToWrite = FMath::RoundToInt(CurrentDurability);
     if (DesiredSlotCount <= 0)
     {
         return false;
@@ -1300,9 +1354,10 @@ bool UTDInventoryBlueprintLibrary::TryAddItem(UObject* InventoryContext, FName I
     UE_LOG(
         LogTemp,
         Warning,
-        TEXT("TryAddItem Begin | ItemID=%s Quantity=%d DataFound=%s Stackable=%s MaxStack=%d RawSlots=%d DesiredSlots=%d"),
+        TEXT("TryAddItem Begin | ItemID=%s Quantity=%d CurrentDurability=%.2f DataFound=%s Stackable=%s MaxStack=%d RawSlots=%d DesiredSlots=%d"),
         *ItemID.ToString(),
         Quantity,
+        CurrentDurability,
         ItemData.bFound ? TEXT("true") : TEXT("false"),
         bIsStackable ? TEXT("true") : TEXT("false"),
         ItemData.MaxStackSize,
@@ -1383,7 +1438,7 @@ bool UTDInventoryBlueprintLibrary::TryAddItem(UObject* InventoryContext, FName I
         FTDInventorySlotData NewSlot;
         NewSlot.ItemID = ItemID;
         NewSlot.Quantity = bIsStackable ? FMath::Min(ItemData.MaxStackSize, RemainingQuantity) : 1;
-        NewSlot.CurrentDurability = 0;
+        NewSlot.CurrentDurability = DurabilityToWrite;
         NewSlot.bIsEmpty = false;
         WorkingSlots[EmptySlotIndex] = NewSlot;
         RemainingQuantity -= NewSlot.Quantity;
@@ -1418,6 +1473,11 @@ bool UTDInventoryBlueprintLibrary::TryAddItem(UObject* InventoryContext, FName I
     TDInventory::BroadcastDelegate(Access.Object, Access.UpdatedDelegateProperty);
     UE_LOG(LogTemp, Warning, TEXT("TryAddItem Success | ItemID=%s QuantityAdded=%d"), *ItemID.ToString(), QuantityAdded);
     return true;
+}
+
+bool UTDInventoryBlueprintLibrary::TryAddItem(UObject* InventoryContext, FName ItemID, int32 Quantity, float CurrentDurability, int32& QuantityAdded)
+{
+    return TryAddItemInternal(InventoryContext, ItemID, Quantity, CurrentDurability, QuantityAdded);
 }
 
 bool UTDInventoryBlueprintLibrary::TryRemoveItem(UObject* InventoryContext, FName ItemID, int32 Quantity, int32& QuantityRemoved)
@@ -1909,33 +1969,45 @@ TArray<FTDInventoryActionEntry> UTDInventoryBlueprintLibrary::GetAvailableAction
 
     const TDInventory::FItemDataView ItemData = TDInventory::GetItemData(Access.Object, SlotData.ItemID);
 
-    FTDInventoryActionEntry DropAction;
-    DropAction.Action = ETDInventoryItemAction::Drop;
-    DropAction.Label = FText::FromString(TEXT("Drop"));
-    Actions.Add(DropAction);
-
-    if (ItemData.ItemTypeName.Equals(TEXT("Consumable"), ESearchCase::IgnoreCase))
+    auto AddAction = [&Actions](ETDInventoryItemAction Action, const TCHAR* Label)
     {
-        FTDInventoryActionEntry UseAction;
-        UseAction.Action = ETDInventoryItemAction::Use;
-        UseAction.Label = FText::FromString(TEXT("Use"));
-        Actions.Add(UseAction);
+        FTDInventoryActionEntry Entry;
+        Entry.Action = Action;
+        Entry.Label = FText::FromString(Label);
+        Actions.Add(Entry);
+    };
+
+    const bool bIsMaterial = TDInventory::IsItemType(ItemData, TEXT("Material"));
+    const bool bIsAmmo = TDInventory::IsItemType(ItemData, TEXT("Ammo"));
+    const bool bIsConsumable = TDInventory::IsItemType(ItemData, TEXT("Consumable"));
+    const bool bIsEquipment = TDInventory::IsItemType(ItemData, TEXT("Equipment"));
+    if (bIsEquipment)
+    {
+        AddAction(ETDInventoryItemAction::Equip, TEXT("Equip"));
+        AddAction(ETDInventoryItemAction::Drop, TEXT("Drop"));
+        return Actions;
     }
 
-    if (ItemData.ItemTypeName.Equals(TEXT("Equipment"), ESearchCase::IgnoreCase) || ItemData.EquipSlotValue != INDEX_NONE)
+    if (bIsConsumable)
     {
-        FTDInventoryActionEntry EquipAction;
-        EquipAction.Action = ETDInventoryItemAction::Equip;
-        EquipAction.Label = FText::FromString(TEXT("Equip"));
-        Actions.Add(EquipAction);
+        AddAction(ETDInventoryItemAction::Use, TEXT("Use"));
+        AddAction(ETDInventoryItemAction::Drop, TEXT("Drop"));
+        AddAction(ETDInventoryItemAction::Split, TEXT("Split"));
+        return Actions;
     }
+
+    if (bIsMaterial || bIsAmmo)
+    {
+        AddAction(ETDInventoryItemAction::Drop, TEXT("Drop"));
+        AddAction(ETDInventoryItemAction::Split, TEXT("Split"));
+        return Actions;
+    }
+
+    AddAction(ETDInventoryItemAction::Drop, TEXT("Drop"));
 
     if (TDInventory::IsStackableItem(ItemData))
     {
-        FTDInventoryActionEntry SplitAction;
-        SplitAction.Action = ETDInventoryItemAction::Split;
-        SplitAction.Label = FText::FromString(TEXT("Split"));
-        Actions.Add(SplitAction);
+        AddAction(ETDInventoryItemAction::Split, TEXT("Split"));
     }
 
     return Actions;
