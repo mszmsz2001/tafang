@@ -1,6 +1,7 @@
 #include "Inventory/TDInventoryBlueprintLibrary.h"
 
 #include "Engine/DataTable.h"
+#include "Engine/Engine.h"
 #include "Engine/StaticMeshActor.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
@@ -308,6 +309,15 @@ namespace TDInventory
         }
 
         return Property->GetFName() == ExactName || Property->GetName().Contains(FallbackToken, ESearchCase::IgnoreCase);
+    }
+
+    void LogDropDebug(const FString& Message)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("%s"), *Message);
+        if (GEngine)
+        {
+            GEngine->AddOnScreenDebugMessage(-1, 6.0f, FColor::Yellow, Message);
+        }
     }
 
     FProperty* FindPropertyByNameOrToken(UClass* Class, const FName& ExactName, const TCHAR* FallbackToken)
@@ -1245,6 +1255,15 @@ FString UTDInventoryBlueprintLibrary::GetInventoryDebugSummary(UObject* Inventor
         Summary += FString::Printf(TEXT(", MaxSlots=%d"), Access.MaxSlotsProperty->GetPropertyValue_InContainer(Access.Object));
     }
 
+    if (Access.Object)
+    {
+        UClass* DroppedItemActorClass = TDInventory::GetDroppedItemActorClass(Access.Object);
+        Summary += FString::Printf(
+            TEXT(", DroppedItemActorClass=%s"),
+            DroppedItemActorClass ? *DroppedItemActorClass->GetName() : TEXT("null")
+        );
+    }
+
     return Summary;
 }
 
@@ -1714,34 +1733,46 @@ bool UTDInventoryBlueprintLibrary::DropItem(UObject* InventoryContext, int32 Slo
     const TDInventory::FSlotStructAccess SlotAccess = TDInventory::ResolveSlotAccess(Access.SlotsProperty);
     if (!Access.Object || !SlotAccess.Struct)
     {
+        TDInventory::LogDropDebug(TEXT("DropItem failed: inventory or slot struct unresolved"));
         return false;
     }
 
     FScriptArrayHelper SlotsHelper(Access.SlotsProperty, Access.SlotsProperty->ContainerPtrToValuePtr<void>(Access.Object));
     if (!SlotsHelper.IsValidIndex(SlotIndex))
     {
+        TDInventory::LogDropDebug(FString::Printf(TEXT("DropItem failed: invalid SlotIndex=%d RawSlots=%d"), SlotIndex, SlotsHelper.Num()));
         return false;
     }
 
     const FTDInventorySlotData SlotData = TDInventory::ReadSlotData(SlotAccess, SlotsHelper.GetRawPtr(SlotIndex));
     if (SlotData.bIsEmpty)
     {
+        TDInventory::LogDropDebug(FString::Printf(TEXT("DropItem failed: empty slot Index=%d"), SlotIndex));
         return false;
     }
 
     if (Quantity > SlotData.Quantity)
     {
+        TDInventory::LogDropDebug(FString::Printf(TEXT("DropItem failed: requested Quantity=%d > SlotQuantity=%d"), Quantity, SlotData.Quantity));
         return false;
     }
 
     const int32 DesiredDropCount = Quantity > 0 ? Quantity : SlotData.Quantity;
     if (DesiredDropCount <= 0)
     {
+        TDInventory::LogDropDebug(FString::Printf(TEXT("DropItem failed: invalid DesiredDropCount=%d"), DesiredDropCount));
         return false;
     }
 
     const TDInventory::FItemDataView ItemData = TDInventory::GetItemData(Access.Object, SlotData.ItemID);
     AActor* SpawnedDropActor = nullptr;
+    TDInventory::LogDropDebug(FString::Printf(
+        TEXT("DropItem begin: ItemID=%s Quantity=%d Durability=%d DropMesh=%s"),
+        *SlotData.ItemID.ToString(),
+        DesiredDropCount,
+        SlotData.CurrentDurability,
+        ItemData.DropMesh ? *ItemData.DropMesh->GetName() : TEXT("null")
+    ));
     if (AActor* OwnerActor = TDInventory::ResolveActor(InventoryContext))
     {
         UWorld* World = OwnerActor->GetWorld();
@@ -1749,30 +1780,62 @@ bool UTDInventoryBlueprintLibrary::DropItem(UObject* InventoryContext, int32 Slo
         {
             const FVector SpawnLocation = DropLocation.IsNearlyZero() ? OwnerActor->GetActorLocation() + OwnerActor->GetActorForwardVector() * 120.0f : DropLocation;
             const FRotator SpawnRotation = OwnerActor->GetActorRotation();
+            TDInventory::LogDropDebug(FString::Printf(TEXT("DropItem spawn location: %s"), *SpawnLocation.ToCompactString()));
 
             if (UClass* DroppedItemActorClass = TDInventory::GetDroppedItemActorClass(Access.Object))
             {
                 const FTransform SpawnTransform(SpawnRotation, SpawnLocation);
-                SpawnedDropActor = World->SpawnActorDeferred<AActor>(DroppedItemActorClass, SpawnTransform, OwnerActor);
+                TDInventory::LogDropDebug(FString::Printf(TEXT("DropItem using DroppedItemActorClass=%s"), *DroppedItemActorClass->GetName()));
+                SpawnedDropActor = World->SpawnActorDeferred<AActor>(
+                    DroppedItemActorClass,
+                    SpawnTransform,
+                    OwnerActor,
+                    nullptr,
+                    ESpawnActorCollisionHandlingMethod::AlwaysSpawn
+                );
                 if (!SpawnedDropActor)
                 {
-                    UE_LOG(LogTemp, Warning, TEXT("DropItem failed to deferred spawn DroppedItemActorClass=%s"), *DroppedItemActorClass->GetName());
+                    TDInventory::LogDropDebug(FString::Printf(TEXT("DropItem failed: deferred spawn class=%s"), *DroppedItemActorClass->GetName()));
                     return false;
                 }
 
                 TDInventory::SetDroppedActorInventoryData(SpawnedDropActor, SlotData, DesiredDropCount);
                 SpawnedDropActor->FinishSpawning(SpawnTransform);
+                TDInventory::LogDropDebug(FString::Printf(TEXT("DropItem spawned actor=%s class=%s"), *SpawnedDropActor->GetName(), *SpawnedDropActor->GetClass()->GetName()));
             }
             else if (ItemData.DropMesh)
             {
-                AStaticMeshActor* DroppedActor = World->SpawnActor<AStaticMeshActor>(AStaticMeshActor::StaticClass(), SpawnLocation, SpawnRotation);
+                TDInventory::LogDropDebug(TEXT("DropItem using StaticMeshActor fallback"));
+                FActorSpawnParameters SpawnParameters;
+                SpawnParameters.Owner = OwnerActor;
+                SpawnParameters.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+                AStaticMeshActor* DroppedActor = World->SpawnActor<AStaticMeshActor>(AStaticMeshActor::StaticClass(), SpawnLocation, SpawnRotation, SpawnParameters);
                 if (DroppedActor)
                 {
                     DroppedActor->GetStaticMeshComponent()->SetStaticMesh(ItemData.DropMesh);
                     SpawnedDropActor = DroppedActor;
+                    TDInventory::LogDropDebug(FString::Printf(TEXT("DropItem spawned fallback actor=%s"), *SpawnedDropActor->GetName()));
                 }
             }
+            else
+            {
+                TDInventory::LogDropDebug(TEXT("DropItem failed: DroppedItemActorClass=null and DropMesh=null"));
+            }
         }
+        else
+        {
+            TDInventory::LogDropDebug(TEXT("DropItem failed: World=null"));
+        }
+    }
+    else
+    {
+        TDInventory::LogDropDebug(TEXT("DropItem failed: OwnerActor=null"));
+    }
+
+    if (!SpawnedDropActor)
+    {
+        TDInventory::LogDropDebug(TEXT("DropItem failed: no dropped actor spawned, inventory unchanged"));
+        return false;
     }
 
     int32 RemovedQuantity = 0;
@@ -1782,11 +1845,13 @@ bool UTDInventoryBlueprintLibrary::DropItem(UObject* InventoryContext, int32 Slo
         {
             SpawnedDropActor->Destroy();
         }
+        TDInventory::LogDropDebug(TEXT("DropItem failed: inventory remove failed, spawned actor destroyed"));
         return false;
     }
 
     QuantityDropped = RemovedQuantity;
     TDInventory::BroadcastDelegate(Access.Object, Access.UpdatedDelegateProperty);
+    TDInventory::LogDropDebug(FString::Printf(TEXT("DropItem success: removed=%d actor=%s"), QuantityDropped, *SpawnedDropActor->GetName()));
     return QuantityDropped > 0;
 }
 
