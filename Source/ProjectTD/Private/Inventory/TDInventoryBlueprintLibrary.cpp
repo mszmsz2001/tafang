@@ -429,21 +429,15 @@ namespace TDInventory
         return Access;
     }
 
-    FSlotStructAccess ResolveSlotAccess(const FArrayProperty* SlotsProperty)
+    FSlotStructAccess ResolveSlotAccessFromStruct(UScriptStruct* SlotStruct)
     {
         FSlotStructAccess Access;
-        if (!SlotsProperty)
+        if (!SlotStruct)
         {
             return Access;
         }
 
-        const FStructProperty* StructProperty = CastField<FStructProperty>(SlotsProperty->Inner);
-        if (!StructProperty)
-        {
-            return Access;
-        }
-
-        Access.Struct = StructProperty->Struct;
+        Access.Struct = SlotStruct;
         Access.ItemIDProperty = FindFProperty<FNameProperty>(Access.Struct, ItemIDPropertyName);
         Access.QuantityProperty = FindFProperty<FIntProperty>(Access.Struct, QuantityPropertyName);
         Access.CurrentDurabilityProperty = FindFProperty<FProperty>(Access.Struct, CurrentDurabilityPropertyName);
@@ -493,6 +487,17 @@ namespace TDInventory
         }
 
         return Access;
+    }
+
+    FSlotStructAccess ResolveSlotAccess(const FArrayProperty* SlotsProperty)
+    {
+        if (!SlotsProperty)
+        {
+            return FSlotStructAccess();
+        }
+
+        const FStructProperty* StructProperty = CastField<FStructProperty>(SlotsProperty->Inner);
+        return StructProperty ? ResolveSlotAccessFromStruct(StructProperty->Struct) : FSlotStructAccess();
     }
 
     FEquipmentComponentAccess ResolveEquipment(UObject* InventoryContext)
@@ -1067,6 +1072,119 @@ namespace TDInventory
         return true;
     }
 
+    bool TryAddSlotDataToInventory(UObject* InventoryContext, const FTDInventorySlotData& SlotToAdd, int32& OutAddedSlotIndex, bool bBroadcastInventoryUpdated)
+    {
+        OutAddedSlotIndex = INDEX_NONE;
+        if (SlotToAdd.bIsEmpty || SlotToAdd.ItemID.IsNone() || SlotToAdd.Quantity <= 0)
+        {
+            return false;
+        }
+
+        const FInventoryComponentAccess Access = ResolveInventory(InventoryContext);
+        const FSlotStructAccess SlotAccess = ResolveSlotAccess(Access.SlotsProperty);
+        if (!Access.Object || !SlotAccess.Struct)
+        {
+            return false;
+        }
+
+        FScriptArrayHelper SlotsHelper(Access.SlotsProperty, Access.SlotsProperty->ContainerPtrToValuePtr<void>(Access.Object));
+        const FItemDataView ItemData = GetItemData(Access.Object, SlotToAdd.ItemID);
+        const bool bIsStackable = IsStackableItem(ItemData);
+        const int32 DesiredSlotCount = FMath::Max(SlotsHelper.Num(), GetDesiredSlotCount(Access));
+        if (DesiredSlotCount <= 0)
+        {
+            return false;
+        }
+
+        TArray<FTDInventorySlotData> WorkingSlots;
+        WorkingSlots.Reserve(DesiredSlotCount);
+        for (int32 Index = 0; Index < DesiredSlotCount; ++Index)
+        {
+            WorkingSlots.Add(SlotsHelper.IsValidIndex(Index)
+                ? ReadSlotData(SlotAccess, SlotsHelper.GetRawPtr(Index))
+                : MakeEmptySlotData());
+        }
+
+        int32 RemainingQuantity = SlotToAdd.Quantity;
+        if (bIsStackable)
+        {
+            for (int32 Index = 0; Index < WorkingSlots.Num() && RemainingQuantity > 0; ++Index)
+            {
+                FTDInventorySlotData& ExistingSlot = WorkingSlots[Index];
+                if (ExistingSlot.bIsEmpty || ExistingSlot.ItemID != SlotToAdd.ItemID)
+                {
+                    continue;
+                }
+
+                const int32 AvailableSpace = ItemData.MaxStackSize - ExistingSlot.Quantity;
+                if (AvailableSpace <= 0)
+                {
+                    continue;
+                }
+
+                const int32 QuantityToAdd = FMath::Min(AvailableSpace, RemainingQuantity);
+                ExistingSlot.Quantity += QuantityToAdd;
+                ExistingSlot.bIsEmpty = false;
+                RemainingQuantity -= QuantityToAdd;
+                if (OutAddedSlotIndex == INDEX_NONE)
+                {
+                    OutAddedSlotIndex = Index;
+                }
+            }
+        }
+
+        while (RemainingQuantity > 0)
+        {
+            int32 EmptySlotIndex = INDEX_NONE;
+            for (int32 Index = 0; Index < WorkingSlots.Num(); ++Index)
+            {
+                if (WorkingSlots[Index].bIsEmpty)
+                {
+                    EmptySlotIndex = Index;
+                    break;
+                }
+            }
+
+            if (EmptySlotIndex == INDEX_NONE)
+            {
+                OutAddedSlotIndex = INDEX_NONE;
+                return false;
+            }
+
+            FTDInventorySlotData NewSlot = SlotToAdd;
+            NewSlot.Quantity = bIsStackable ? FMath::Min(ItemData.MaxStackSize, RemainingQuantity) : 1;
+            NewSlot.bIsEmpty = false;
+            WorkingSlots[EmptySlotIndex] = NewSlot;
+            RemainingQuantity -= NewSlot.Quantity;
+            if (OutAddedSlotIndex == INDEX_NONE)
+            {
+                OutAddedSlotIndex = EmptySlotIndex;
+            }
+        }
+
+        if (OutAddedSlotIndex == INDEX_NONE)
+        {
+            return false;
+        }
+
+        if (SlotsHelper.Num() < WorkingSlots.Num())
+        {
+            SlotsHelper.Resize(WorkingSlots.Num());
+        }
+
+        for (int32 Index = 0; Index < WorkingSlots.Num(); ++Index)
+        {
+            WriteSlotData(SlotAccess, SlotsHelper.GetRawPtr(Index), WorkingSlots[Index]);
+        }
+
+        if (bBroadcastInventoryUpdated)
+        {
+            BroadcastDelegate(Access.Object, Access.UpdatedDelegateProperty);
+        }
+
+        return true;
+    }
+
     bool TryEquipFromInventory(UObject* InventoryContext, FScriptArrayHelper& SlotsHelper, const FSlotStructAccess& SlotAccess, int32 SlotIndex)
     {
         if (!SlotsHelper.IsValidIndex(SlotIndex))
@@ -1230,6 +1348,7 @@ namespace TDInventory
 
         return true;
     }
+
 }
 
 UObject* UTDInventoryBlueprintLibrary::ResolveInventoryComponent(UObject* InventoryContext)
@@ -1314,6 +1433,97 @@ FString UTDInventoryBlueprintLibrary::GetInventoryDebugSummary(UObject* Inventor
         Summary += FString::Printf(
             TEXT(", DroppedItemActorClass=%s"),
             DroppedItemActorClass ? *DroppedItemActorClass->GetName() : TEXT("null")
+        );
+    }
+
+    return Summary;
+}
+
+FString UTDInventoryBlueprintLibrary::GetEquipmentDebugSummary(UObject* EquipmentContext)
+{
+    if (!EquipmentContext)
+    {
+        return TEXT("EquipmentContext=null");
+    }
+
+    const TDInventory::FEquipmentComponentAccess EquipmentAccess = TDInventory::ResolveEquipment(EquipmentContext);
+    FString Summary = FString::Printf(
+        TEXT("Context=%s, Resolved=%s"),
+        *EquipmentContext->GetClass()->GetName(),
+        EquipmentAccess.Object ? *EquipmentAccess.Object->GetClass()->GetName() : TEXT("null")
+    );
+
+    Summary += FString::Printf(
+        TEXT(", EquipSlotsProp=%s, Delegate=%s"),
+        EquipmentAccess.EquipSlotsProperty ? *EquipmentAccess.EquipSlotsProperty->GetName() : TEXT("null"),
+        EquipmentAccess.UpdatedDelegateProperty ? *EquipmentAccess.UpdatedDelegateProperty->GetName() : TEXT("null")
+    );
+
+    if (!EquipmentAccess.Object || !EquipmentAccess.EquipSlotsProperty)
+    {
+        return Summary;
+    }
+
+    const TDInventory::FInventoryComponentAccess InventoryAccess = TDInventory::ResolveInventory(EquipmentAccess.Object);
+    Summary += FString::Printf(
+        TEXT(", InventoryResolved=%s"),
+        InventoryAccess.Object ? *InventoryAccess.Object->GetClass()->GetName() : TEXT("null")
+    );
+
+    FScriptMapHelper MapHelper(
+        EquipmentAccess.EquipSlotsProperty,
+        EquipmentAccess.EquipSlotsProperty->ContainerPtrToValuePtr<void>(EquipmentAccess.Object)
+    );
+
+    FProperty* KeyProperty = EquipmentAccess.EquipSlotsProperty->KeyProp;
+    FStructProperty* ValueStructProperty = CastField<FStructProperty>(EquipmentAccess.EquipSlotsProperty->ValueProp);
+    Summary += FString::Printf(
+        TEXT(", KeyProp=%s, ValueStruct=%s, MapPairs=%d"),
+        KeyProperty ? *KeyProperty->GetClass()->GetName() : TEXT("null"),
+        ValueStructProperty && ValueStructProperty->Struct ? *ValueStructProperty->Struct->GetName() : TEXT("null"),
+        MapHelper.Num()
+    );
+
+    TDInventory::FSlotStructAccess SlotAccess;
+    if (ValueStructProperty && ValueStructProperty->Struct)
+    {
+        SlotAccess = TDInventory::ResolveSlotAccessFromStruct(ValueStructProperty->Struct);
+    }
+
+    for (int32 MapIndex = 0; MapIndex < MapHelper.GetMaxIndex(); ++MapIndex)
+    {
+        if (!MapHelper.IsValidIndex(MapIndex))
+        {
+            continue;
+        }
+
+        int32 KeyValue = INDEX_NONE;
+        FString KeyName;
+        if (KeyProperty)
+        {
+            int64 EnumValue = INDEX_NONE;
+            FString EnumDisplay;
+            if (TDInventory::ReadEnumDisplayValue(KeyProperty, MapHelper.GetKeyPtr(MapIndex), EnumValue, EnumDisplay))
+            {
+                KeyValue = static_cast<int32>(EnumValue);
+                KeyName = EnumDisplay;
+            }
+            else if (TDInventory::ReadIntValue(KeyProperty, MapHelper.GetKeyPtr(MapIndex), KeyValue))
+            {
+                KeyName = FString::FromInt(KeyValue);
+            }
+        }
+
+        const FTDInventorySlotData SlotData = TDInventory::ReadSlotData(SlotAccess, MapHelper.GetValuePtr(MapIndex));
+        Summary += FString::Printf(
+            TEXT(" [MapIndex=%d Key=%d KeyName=%s ItemID=%s Quantity=%d Dur=%d Empty=%s]"),
+            MapIndex,
+            KeyValue,
+            KeyName.IsEmpty() ? TEXT("unknown") : *KeyName,
+            *SlotData.ItemID.ToString(),
+            SlotData.Quantity,
+            SlotData.CurrentDurability,
+            SlotData.bIsEmpty ? TEXT("true") : TEXT("false")
         );
     }
 
@@ -2094,4 +2304,104 @@ bool UTDInventoryBlueprintLibrary::ExecuteItemAction(
     }
 
     return false;
+}
+
+bool UTDInventoryBlueprintLibrary::TryUnequipItem(UObject* EquipmentContext, uint8 EquipSlot, int32& OutAddedSlotIndex)
+{
+    OutAddedSlotIndex = INDEX_NONE;
+    if (!EquipmentContext)
+    {
+        return false;
+    }
+
+    const int32 EquipSlotValue = static_cast<int32>(EquipSlot);
+    if (EquipSlotValue == 0)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("TryUnequipItem failed: EquipSlot is None."));
+        return false;
+    }
+
+    const TDInventory::FEquipmentComponentAccess EquipmentAccess = TDInventory::ResolveEquipment(EquipmentContext);
+    if (!EquipmentAccess.Object || !EquipmentAccess.EquipSlotsProperty)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("TryUnequipItem failed: Equipment component or EquipSlots map was not found."));
+        return false;
+    }
+
+    const TDInventory::FInventoryComponentAccess InventoryAccess = TDInventory::ResolveInventory(EquipmentAccess.Object);
+    const TDInventory::FSlotStructAccess InventorySlotAccess = TDInventory::ResolveSlotAccess(InventoryAccess.SlotsProperty);
+    if (!InventoryAccess.Object || !InventorySlotAccess.Struct)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("TryUnequipItem failed: Inventory component or Slots array was not found."));
+        return false;
+    }
+
+    FScriptMapHelper MapHelper(EquipmentAccess.EquipSlotsProperty, EquipmentAccess.EquipSlotsProperty->ContainerPtrToValuePtr<void>(EquipmentAccess.Object));
+    FProperty* KeyProperty = EquipmentAccess.EquipSlotsProperty->KeyProp;
+    FStructProperty* ValueStructProperty = CastField<FStructProperty>(EquipmentAccess.EquipSlotsProperty->ValueProp);
+    if (!KeyProperty || !ValueStructProperty || ValueStructProperty->Struct != InventorySlotAccess.Struct)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("TryUnequipItem failed: EquipSlots key/value type is not compatible with inventory slot data."));
+        return false;
+    }
+
+    int32 TargetMapIndex = INDEX_NONE;
+    for (int32 MapIndex = 0; MapIndex < MapHelper.GetMaxIndex(); ++MapIndex)
+    {
+        if (!MapHelper.IsValidIndex(MapIndex))
+        {
+            continue;
+        }
+
+        int32 ExistingKey = INDEX_NONE;
+        if (TDInventory::ReadIntValue(KeyProperty, MapHelper.GetKeyPtr(MapIndex), ExistingKey) && ExistingKey == EquipSlotValue)
+        {
+            TargetMapIndex = MapIndex;
+            break;
+        }
+    }
+
+    if (TargetMapIndex == INDEX_NONE)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("TryUnequipItem failed: EquipSlot=%d was not found."), EquipSlotValue);
+        return false;
+    }
+
+    const FTDInventorySlotData EquippedSlot = TDInventory::ReadSlotData(InventorySlotAccess, MapHelper.GetValuePtr(TargetMapIndex));
+    if (EquippedSlot.bIsEmpty)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("TryUnequipItem failed: EquipSlot=%d is empty."), EquipSlotValue);
+        return false;
+    }
+
+    int32 AddedSlotIndex = INDEX_NONE;
+    if (!TDInventory::TryAddSlotDataToInventory(InventoryAccess.Object, EquippedSlot, AddedSlotIndex, false))
+    {
+        UE_LOG(
+            LogTemp,
+            Warning,
+            TEXT("TryUnequipItem failed: inventory cannot receive ItemID=%s Quantity=%d from EquipSlot=%d."),
+            *EquippedSlot.ItemID.ToString(),
+            EquippedSlot.Quantity,
+            EquipSlotValue
+        );
+        return false;
+    }
+
+    TDInventory::WriteSlotData(InventorySlotAccess, MapHelper.GetValuePtr(TargetMapIndex), TDInventory::MakeEmptySlotData());
+    OutAddedSlotIndex = AddedSlotIndex;
+    TDInventory::BroadcastDelegate(EquipmentAccess.Object, EquipmentAccess.UpdatedDelegateProperty);
+    TDInventory::BroadcastDelegate(InventoryAccess.Object, InventoryAccess.UpdatedDelegateProperty);
+
+    UE_LOG(
+        LogTemp,
+        Warning,
+        TEXT("TryUnequipItem success: EquipmentObject=%s EquipSlot=%d ItemID=%s Quantity=%d AddedSlotIndex=%d"),
+        *EquipmentAccess.Object->GetName(),
+        EquipSlotValue,
+        *EquippedSlot.ItemID.ToString(),
+        EquippedSlot.Quantity,
+        OutAddedSlotIndex
+    );
+    return true;
 }

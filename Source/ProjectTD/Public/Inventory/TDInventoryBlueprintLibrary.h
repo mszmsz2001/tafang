@@ -70,6 +70,9 @@ public:
     static FString GetInventoryDebugSummary(UObject* InventoryContext);
 
     UFUNCTION(BlueprintPure, Category = "ProjectTD|Inventory")
+    static FString GetEquipmentDebugSummary(UObject* EquipmentContext);
+
+    UFUNCTION(BlueprintPure, Category = "ProjectTD|Inventory")
     static int32 GetInventoryMaxSlots(UObject* InventoryContext);
 
     UFUNCTION(BlueprintCallable, Category = "ProjectTD|Inventory", meta = (CPP_Default_CurrentDurability = "-1.0"))
@@ -113,4 +116,7 @@ public:
         FVector DropLocation,
         int32& QuantityProcessed
     );
+
+    UFUNCTION(BlueprintCallable, Category = "ProjectTD|Inventory")
+    static bool TryUnequipItem(UObject* EquipmentContext, uint8 EquipSlot, int32& OutAddedSlotIndex);
 };
